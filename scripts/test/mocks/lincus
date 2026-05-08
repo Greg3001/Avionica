@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Mock de `lincus` para testing en macOS.
+# Registra la llamada en $MOCK_TRACE y simula salidas mínimas.
+
+: "${MOCK_TRACE:=/tmp/av-mock-trace.log}"
+: "${MOCK_INSTALLED:=}"   # lista separada por espacios de IDs ya instalados
+
+echo "lincus $*" >> "$MOCK_TRACE"
+
+case "${1:-}" in
+  list)
+    # Devuelve una tabla con los escenarios "instalados"
+    cat <<EOF
++---------+---------+-------------------------------------+
+| ID      | RUNNING | TITLE                               |
++---------+---------+-------------------------------------+
+EOF
+    for id in $MOCK_INSTALLED; do
+      printf "| %-7s |         | %-35s |\n" "$id" "(mock) $id"
+    done
+    echo "+---------+---------+-------------------------------------+"
+    ;;
+  install)
+    # marca como instalado (no podemos persistir env entre invocaciones,
+    # pero el test runner puede pre-rellenar MOCK_INSTALLED).
+    echo "[mock] install $2 OK"
+    ;;
+  start|stop|clear|save)
+    echo "[mock] $1 ${2:-} OK"
+    ;;
+  *)
+    echo "[mock-lincus] $*"
+    ;;
+esac
+exit 0

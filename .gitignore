@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+._*
+
+# Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Artefactos del runtime
+/tmp/av-*
+scripts/test/*.log
+*.pcap
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Backups del aula
+L*-E*.bak.tgz

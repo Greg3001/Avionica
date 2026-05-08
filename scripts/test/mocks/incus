@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# Mock de `incus` con consciencia de topología.
+#
+# Si SCENARIO_DIR está definido, lee topology.yaml y responde con MACs reales
+# y validación básica (host/iface deben existir).  Si no, responde genérico.
+#
+# Variables:
+#   MOCK_TRACE     -> fichero donde se registra cada llamada
+#   SCENARIO_DIR   -> dir con topology.yaml (formato lincus)
+#   MOCK_STRICT=1  -> falla si el host/iface no existe en la topología
+
+: "${MOCK_TRACE:=/tmp/av-mock-trace.log}"
+: "${SCENARIO_DIR:=}"
+: "${MOCK_STRICT:=0}"
+
+echo "incus $*" >> "$MOCK_TRACE"
+
+# ---------- topología (lazy-load) ----------
+topo_lookup_mac() {
+  local host="$1" iface="$2"
+  [ -z "$SCENARIO_DIR" ] && return 1
+  local topo="$SCENARIO_DIR/topology.yaml"
+  [ -f "$topo" ] || return 1
+  python3 - "$topo" "$host" "$iface" <<'PY' 2>/dev/null
+import sys, re
+path, host, iface = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    text = f.read()
+# Localiza el bloque del host
+m = re.search(rf'^  {re.escape(host)}:\s*\n(.*?)(?=^  \w|^networks:|\Z)',
+              text, re.S | re.M)
+if not m:
+    sys.exit(1)
+block = m.group(1)
+# Localiza la interfaz
+m2 = re.search(rf'^\s+{re.escape(iface)}:\s*\n(.*?)(?=^\s{{8}}\w|^      \w|\Z)',
+               block, re.S | re.M)
+if not m2:
+    sys.exit(1)
+ib = m2.group(1)
+m3 = re.search(r'hwaddr:\s*([0-9a-fA-F:]+)', ib)
+if m3:
+    print(m3.group(1))
+PY
+}
+
+topo_host_exists() {
+  local host="$1"
+  [ -z "$SCENARIO_DIR" ] && return 0   # sin topo, no validamos
+  local topo="$SCENARIO_DIR/topology.yaml"
+  [ -f "$topo" ] || return 0
+  grep -qE "^  ${host}:" "$topo"
+}
+
+topo_iface_exists() {
+  local host="$1" iface="$2"
+  [ -z "$SCENARIO_DIR" ] && return 0
+  local topo="$SCENARIO_DIR/topology.yaml"
+  [ -f "$topo" ] || return 0
+  python3 - "$topo" "$host" "$iface" <<'PY' 2>/dev/null
+import sys, re
+path, host, iface = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path).read()
+m = re.search(rf'^  {re.escape(host)}:\s*\n(.*?)(?=^  \w|^networks:|\Z)',
+              text, re.S | re.M)
+if not m:
+    sys.exit(1)
+if re.search(rf'^\s+{re.escape(iface)}:\s*\n', m.group(1), re.M):
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Devuelve (vía stdout) si es router (R*) — los routers tienen vtysh.
+is_router() { [[ "$1" =~ ^R[0-9]+$ ]]; }
+
+case "${1:-}" in
+  exec)
+    host="$2"
+    shift 2
+    [ "${1:-}" = "--" ] && shift
+
+    if [ "$MOCK_STRICT" = "1" ] && ! topo_host_exists "$host"; then
+      echo "[mock-incus] ERROR: host '$host' no existe en topología" >&2
+      exit 1
+    fi
+
+    case "${1:-}" in
+      ip)
+        # ip [-4] address show [IFACE] / link show [IFACE] / etc.
+        local_iface=""
+        # Busca el último argumento que parezca interfaz (eth0, bond0, etc.)
+        for a in "$@"; do
+          case "$a" in eth*|bond*|lo) local_iface="$a" ;; esac
+        done
+
+        case "$2 $3" in
+          "address show"|"-4 address")
+            mac="$(topo_lookup_mac "$host" "${local_iface:-eth0}" 2>/dev/null)"
+            [ -z "$mac" ] && mac="00:00:00:00:00:00"
+            cat <<EOF
+1: ${local_iface:-eth0}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP qlen 1000
+    link/ether ${mac} brd ff:ff:ff:ff:ff:ff
+EOF
+            ;;
+          "link show"|"link"*)
+            mac="$(topo_lookup_mac "$host" "${local_iface:-eth0}" 2>/dev/null)"
+            [ -z "$mac" ] && mac="00:00:00:00:00:00"
+            cat <<EOF
+1: ${local_iface:-eth0}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP
+    link/ether ${mac} brd ff:ff:ff:ff:ff:ff
+EOF
+            ;;
+          "neigh show")
+            echo "192.168.1.1 lladdr aa:bb:cc:dd:ee:ff dev ${local_iface:-eth0} REACHABLE (mock)"
+            ;;
+        esac
+
+        # Validar interfaces sólo en operaciones de LECTURA y sólo para
+        # nombres de interfaz "físicos" (eth\d+).  Los comandos `ip link add`,
+        # `ip link set ... master ...`, `ip address add` crean/modifican y
+        # pueden referirse a ifaces virtuales (bond0, eth0-vl2) que aún no
+        # existen en la topología.
+        if [ "$MOCK_STRICT" = "1" ] && [ "$2" = "show" -o "$3" = "show" ] \
+           && [ -n "$local_iface" ] \
+           && [[ "$local_iface" =~ ^eth[0-9]+$ ]] \
+           && ! topo_iface_exists "$host" "$local_iface"; then
+          echo "[mock-incus] ERROR: $host no tiene interfaz $local_iface" >&2
+          exit 1
+        fi
+        ;;
+      sh)
+        # heredoc: descarta stdin
+        if [ "${2:-}" = "-c" ]; then
+          # Si dentro de -c hay nohup ... &, finge que arranca y guarda PID 1
+          if echo "${3:-}" | grep -q "nohup"; then
+            echo "[mock] $host: nohup en background simulado"
+          fi
+        else
+          cat >/dev/null
+        fi
+        ;;
+      tcpdump)
+        echo "[mock] tcpdump@$host args: $*"
+        ;;
+      socat)
+        echo "[mock] socat@$host args: $*"
+        ;;
+      nc)
+        echo "[mock] nc@$host args: $*"
+        ;;
+      tc)
+        echo "[mock] tc@$host args: $*"
+        ;;
+      cat)
+        # cat /tmp/p3e01-rx-data — devuelve contenido simulado
+        case "${2:-}" in
+          /tmp/p1e02-cap.out|/tmp/p1e01-cap.out|/tmp/p2-dhcp.out|/tmp/p3e01-cap.out|/tmp/p3e02-cap.out)
+            echo "(captura simulada en macOS)" ;;
+          /tmp/p3e01-rx-data)
+            echo "PRUEBA"; echo "PRUEBA" ;;
+          /tmp/p3e02-rx-vl2-p1.log)
+            echo "HOLA"; echo "HOLA" ;;
+        esac
+        ;;
+      chmod)
+        echo "[mock] chmod@$host: $*"
+        ;;
+      ping)
+        echo "1 packets transmitted, 1 packets received, 0% packet loss (mock)"
+        ;;
+      which)
+        if is_router "$host"; then echo "/usr/bin/vtysh"; exit 0; else exit 1; fi
+        ;;
+      vtysh)
+        echo "[mock-vtysh@$host] $*"
+        ;;
+      rc-service)
+        echo "[mock] rc-service ${2:-?} ${3:-?} OK"
+        ;;
+      reboot)
+        echo "[mock] $host reboot OK"
+        ;;
+    esac
+    ;;
+  file)
+    # incus file push SRC TARGET   o   pull TARGET DEST
+    if [ "${2:-}" = "push" ]; then
+      target="${4:-}"
+      host="${target%%/*}"
+      if [ "$MOCK_STRICT" = "1" ] && [ -n "$host" ] \
+         && ! topo_host_exists "$host"; then
+        echo "[mock-incus] ERROR: host '$host' no existe en topología" >&2
+        exit 1
+      fi
+      echo "[mock] file push ${3:-?} -> ${4:-?}"
+    fi
+    ;;
+  shell)
+    echo "[mock] shell into ${2:-?}"
+    ;;
+  list)
+    echo "[mock] (no implementado)"
+    ;;
+  *)
+    echo "[mock-incus] $*"
+    ;;
+esac
+exit 0
