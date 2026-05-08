@@ -246,4 +246,4 @@ Los `.docx` con los enunciados, las `.pptx` de fundamentos y los `.tgz` original
 
 ## Autoría
 
-Trabajo realizado para la asignatura de Aviónica del 4º curso. Scripts generados en colaboración con Claude Code.
+Trabajo realizado para la asignatura de Aviónica del 4º curso
